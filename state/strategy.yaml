@@ -1,0 +1,13 @@
+version: "01"
+timeframe: "1h"
+entry:
+  indicator: "RSI"
+  threshold: 30
+  condition: "below"
+exit:
+  indicator: "RSI"
+  threshold: 70
+  condition: "above"
+  on_candle_close: true
+stop_loss_pct: 1.8
+position_size_r: 0.5
