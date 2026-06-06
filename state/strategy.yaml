@@ -1,13 +1,11 @@
 version: "01"
+strategy_name: "RSI Mean-Reversion"
 timeframe: "1h"
+
+# Tunable parameters (Hermes changes ONE per reflection cycle)
 entry:
-  indicator: "RSI"
-  threshold: 30
-  condition: "below"
-exit:
-  indicator: "RSI"
-  threshold: 70
-  condition: "above"
-  on_candle_close: true
-stop_loss_pct: 1.8
-position_size_r: 0.5
+  rsi_period: 14                 # RSI lookback period
+  rsi_entry_threshold: 30.0      # enter long when RSI drops below this
+  rsi_exit_threshold: 70.0       # close long when RSI rises above this
+
+stop_loss_pct: 1.8               # stop loss as % below entry price

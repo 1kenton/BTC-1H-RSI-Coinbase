@@ -1,55 +1,135 @@
 """
-Reflection cycle: analyzes trades and proposes ONE strategy change.
+Reflection cycle: after every N closed trades, call Claude to propose ONE strategy tweak.
 """
 import json
-import yaml
 import logging
-from pathlib import Path
+import os
 from datetime import datetime
+from pathlib import Path
+
+import yaml
 
 logger = logging.getLogger(__name__)
 
-def reflect(trades: list, strategy_path: str = "state/strategy.yaml") -> dict:
-    """
-    Analyze N trades and propose ONE variable change.
-    
-    Args:
-        trades: List of trade dicts with pnl, entry_price, exit_price, etc.
-        strategy_path: Path to current strategy.yaml
-    
-    Returns:
-        dict with hypothesis: {variable, old_value, new_value, reason}
-    """
-    if not trades or len(trades) < 5:
-        return {"status": "waiting", "trades_count": len(trades)}
-    
-    # Load current strategy
-    if not Path(strategy_path).exists():
-        strategy_path = f"/app/{strategy_path}"
-    
-    with open(strategy_path) as f:
-        strategy = yaml.safe_load(f)
-    
-    # Analyze trades
-    wins = [t for t in trades if t.get("pnl", 0) > 0]
-    losses = [t for t in trades if t.get("pnl", 0) <= 0]
-    win_rate = len(wins) / len(trades) if trades else 0
-    avg_win = sum(t.get("pnl", 0) for t in wins) / len(wins) if wins else 0
-    avg_loss = sum(t.get("pnl", 0) for t in losses) / len(losses) if losses else 0
-    
-    # Simple hypothesis: if win rate < 50%, tighten entry (raise RSI threshold)
-    hypothesis = None
-    if win_rate < 0.5 and avg_loss < 0:
-        hypothesis = {
-            "variable": "entry.threshold",
-            "old_value": strategy.get("entry", {}).get("threshold", 30),
-            "new_value": 35,
-            "reason": f"Win rate {win_rate:.1%} below 50%, raising RSI entry threshold",
-        }
-    
-    return {
-        "status": "proposed" if hypothesis else "waiting",
+STRATEGY_FILE    = Path("state/strategy.yaml")
+TRADES_FILE      = Path("state/trades.jsonl")
+GOAL_FILE        = Path("state/goal.yaml")
+HYPOTHESES_FILE  = Path("state/hypotheses.jsonl")
+
+TUNABLE = [
+    "entry.rsi_period",
+    "entry.rsi_entry_threshold",
+    "entry.rsi_exit_threshold",
+    "stop_loss_pct",
+]
+
+
+def _load_recent_trades(n: int = 25) -> list:
+    if not TRADES_FILE.exists():
+        return []
+    lines = [l for l in TRADES_FILE.read_text().splitlines() if l.strip()]
+    return [json.loads(l) for l in lines[-n:]]
+
+
+def _summarise(trades: list) -> str:
+    if not trades:
+        return "No trades yet."
+    wins   = [t for t in trades if t.get("pnl_pct", 0) > 0]
+    losses = [t for t in trades if t.get("pnl_pct", 0) <= 0]
+    avg_pnl = sum(t.get("pnl_pct", 0) for t in trades) / len(trades)
+    return (
+        f"Last {len(trades)} trades: {len(wins)} wins / {len(losses)} losses | "
+        f"avg PnL {avg_pnl*100:.3f}%"
+    )
+
+
+def run_reflection() -> bool:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        logger.warning("ANTHROPIC_API_KEY not set — skipping reflection")
+        return False
+
+    try:
+        import anthropic
+    except ImportError:
+        logger.error("anthropic package not installed")
+        return False
+
+    trades   = _load_recent_trades(25)
+    summary  = _summarise(trades)
+    strategy = yaml.safe_load(STRATEGY_FILE.read_text()) if STRATEGY_FILE.exists() else {}
+
+    try:
+        goal_text = GOAL_FILE.read_text() if GOAL_FILE.exists() else "Maximise risk-adjusted returns."
+    except Exception:
+        goal_text = "Maximise risk-adjusted returns."
+
+    prompt = f"""You are a systematic trading strategy optimizer.
+
+Goal: {goal_text}
+
+Performance: {summary}
+
+Current strategy (strategy.yaml):
+{yaml.dump(strategy, default_flow_style=False)}
+
+Tunable parameters (change only ONE):
+{chr(10).join(f"  - {k}" for k in TUNABLE)}
+
+Respond with ONLY valid JSON in this exact format:
+{{
+  "variable": "<dot.path.to.param>",
+  "old_value": <current_numeric_value>,
+  "new_value": <proposed_numeric_value>,
+  "reasoning": "<one sentence>"
+}}"""
+
+    try:
+        client   = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        suggestion = json.loads(raw)
+    except Exception as e:
+        logger.error(f"Anthropic call failed: {e}")
+        return False
+
+    var  = suggestion.get("variable", "")
+    nval = suggestion.get("new_value")
+    if var not in TUNABLE or nval is None:
+        logger.warning(f"Ignoring invalid suggestion: {suggestion}")
+        return False
+
+    # Apply change to strategy.yaml
+    keys = var.split(".")
+    node = strategy
+    for k in keys[:-1]:
+        node = node.setdefault(k, {})
+    node[keys[-1]] = nval
+
+    # Bump version
+    try:
+        ver = int(strategy.get("version", "01")) + 1
+        strategy["version"] = str(ver).zfill(2)
+    except Exception:
+        pass
+
+    STRATEGY_FILE.write_text(yaml.dump(strategy, default_flow_style=False))
+
+    record = {
+        "ts": datetime.utcnow().isoformat(),
         "trades_analyzed": len(trades),
-        "win_rate": win_rate,
-        "hypothesis": hypothesis,
+        **suggestion,
     }
+    HYPOTHESES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(HYPOTHESES_FILE, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+    logger.info(
+        f"Reflection: {var} {suggestion.get('old_value')} → {nval} | "
+        f"{suggestion.get('reasoning', '')}"
+    )
+    return True
