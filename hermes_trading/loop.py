@@ -62,7 +62,7 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text())
         except Exception:
             pass
-    return {"current_trade": None}
+    return {"current_trade": None, "balance": 100.0}
 
 
 def save_state(state: dict) -> None:
@@ -125,11 +125,17 @@ async def loop_once(state: dict) -> dict:
                       "pnl_pct": round(pnl, 6), "close_ts": now_ts}
 
         if closed:
+            _sd = abs(trade["entry_price"] - trade["stop_loss"]) / trade["entry_price"]
+            _pos = (state.get("balance", 100.0) * 0.01 / _sd) if _sd > 0 else 0.0
+            pnl_usd = round(closed["pnl_pct"] * _pos, 4)
+            state["balance"] = round(state.get("balance", 100.0) + pnl_usd, 4)
+            closed["pnl_usd"] = pnl_usd
+            closed["balance"] = state["balance"]
             log_trade(closed)
             logger.info(
                 f"CLOSED | entry={closed['entry_price']:.2f} "
                 f"exit={closed['exit_price']:.2f} reason={closed['exit_reason']} "
-                f"pnl={closed['pnl_pct']*100:.3f}% | RSI={rsi:.1f}"
+                f"pnl={closed['pnl_pct']*100:.3f}% (${pnl_usd:+.4f}) bal=${state['balance']:.4f} | RSI={rsi:.1f}"
             )
             state["current_trade"] = None
             if reflection_due():
